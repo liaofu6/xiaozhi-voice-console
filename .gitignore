@@ -1,0 +1,20 @@
+node_modules/
+npm-debug.log*
+
+# 本地配置与凭据（不要提交）
+.env
+cookie.txt
+endpoint.txt
+# 小智服务端的真实覆盖配置（含 DeepSeek Key）
+xiaozhi-server/.config.yaml
+**/data/.config.yaml
+
+# 运行时产生的日志
+*.log
+server.err
+meting/php-server*.log
+
+# 系统/编辑器杂物
+.DS_Store
+Thumbs.db
+*.lnk

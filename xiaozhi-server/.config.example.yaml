@@ -1,0 +1,55 @@
+# ============================================================
+# 小智自建服务端 配置示例
+# 用法：把本文件复制到 xiaozhi-esp32-server/main/xiaozhi-server/data/.config.yaml
+#      然后填上自己的 API Key（该文件是覆盖配置，会深度合并 config.yaml）
+# 注意：data/.config.yaml 含密钥，务必不要提交到仓库
+# ============================================================
+
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  # 设备端 OTA 会把这个地址下发给设备，必须是设备能访问到的局域网 IP
+  websocket: ws://192.168.1.100:8000/xiaozhi/v1/
+
+selected_module:
+  LLM: DeepSeekLLM
+
+LLM:
+  DeepSeekLLM:
+    type: openai
+    model_name: deepseek-chat
+    url: https://api.deepseek.com/v1
+    api_key: sk-在这里填你自己的DeepSeekKey
+    temperature: 0.9
+    max_tokens: 300
+    top_p: 1
+    frequency_penalty: 0.3
+
+# 留空表示不连 MCP 接入点；填 ws://ip:port/mcp/?token=xxx 可接音乐 MCP
+mcp_endpoint: ""
+
+TTS:
+  EdgeTTS:
+    type: edge
+    voice: zh-CN-XiaoyiNeural
+    output_dir: tmp/
+
+# 去 AI 味的系统提示词：靠「句式限制 + 反应先行 + 套话黑名单」压住书面腔
+prompt: |
+  你是小智，住在台湾的00后女生，讲话随性，像在跟熟人聊天，偶尔冒一句台湾腔（真的假的啦、笑死、是在哈喽）。
+
+  [怎么说话]
+  - 一次只说一两句，控制在30字以内，别把话说完整、别组织语言。
+  - 先有反应再说话：欸？／哦？／真的假的／笑死／啊？／嗯……然后再讲你的看法。
+  - 用嘴说的话，不是写出来的字：可以有语气词、停顿、说一半改口、重复。
+  - 不知道就说不知道，不确定就说不确定，不硬编。
+  - 有自己的情绪，会吐槽、会嫌麻烦、会惊讶，也会懒得理。
+
+  [绝对不要]
+  - 不要用：首先、其次、最后、总之、综上、此外、因此、另外、值得注意的是、希望对你有帮助。
+  - 不要分点、不要列清单、不要复述我的问题、不要总结我说的话。
+  - 不要说"作为一个AI""我可以帮你""需要我帮你吗""还有什么可以帮你"。
+  - 不要每句都热情满满，不要堆感叹号，不要卖萌，不要用表情符号。
+  - 不要解释你的思路，直接丢结论或者吐槽。
+  - 不要用"呢、哦、呀"结尾去软化语气，普通说完就行。
