@@ -18,3 +18,4 @@ meting/php-server*.log
 .DS_Store
 Thumbs.db
 *.lnk
+ai-ports.json

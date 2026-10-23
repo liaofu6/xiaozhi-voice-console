@@ -26,8 +26,12 @@ const MAX_LINES = 800;
 const AI_DIR = process.env.XIAOZHI_SERVER_DIR || findAiDir();
 const AI_APP = AI_DIR ? path.join(AI_DIR, 'main', 'xiaozhi-server', 'app.py') : '';
 const AI_PYTHON = findAiPython(AI_DIR);
-const AI_WS_PORT = Number(process.env.XIAOZHI_WS_PORT || 8000);
-const AI_OTA_PORT = Number(process.env.XIAOZHI_OTA_PORT || 8003);
+const AI_CONFIG_FILE = AI_DIR ? path.join(AI_DIR, 'main', 'xiaozhi-server', 'data', '.config.yaml') : '';
+const AI_PORTS_FILE = path.join(DIR, 'ai-ports.json');
+// 端口优先级：环境变量 > ai-ports.json > 默认 8000/8003
+const AI_PORTS = loadAiPorts();
+let aiWsPort = AI_PORTS.ws;
+let aiOtaPort = AI_PORTS.ota;
 
 // ---------- 状态 ----------
 let child = null;             // 由本控制台启动的音乐服务进程
@@ -90,6 +94,110 @@ function findAiPython(dir) {
     if (fs.existsSync(p2)) return p2;
   }
   return 'python';
+}
+
+// 读取本地保存的 AI 端口（环境变量优先，其次 ai-ports.json，最后默认值）
+function loadAiPorts() {
+  const def = {
+    ws: Number(process.env.XIAOZHI_WS_PORT || 0) || 8000,
+    ota: Number(process.env.XIAOZHI_OTA_PORT || 0) || 8003,
+  };
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(DIR, 'ai-ports.json'), 'utf8'));
+    if (!process.env.XIAOZHI_WS_PORT && Number(j.wsPort) > 0) def.ws = Number(j.wsPort);
+    if (!process.env.XIAOZHI_OTA_PORT && Number(j.otaPort) > 0) def.ota = Number(j.otaPort);
+  } catch (_) {}
+  return def;
+}
+
+// 把端口写进小智服务端的 data/.config.yaml（改 server.port / http_port / websocket）
+function patchAiConfig(wsPort, otaPort, lanIpV) {
+  if (!AI_CONFIG_FILE || !fs.existsSync(AI_CONFIG_FILE)) {
+    return { ok: false, msg: '找不到服务端配置文件：' + (AI_CONFIG_FILE || '（未找到服务端目录）') };
+  }
+  let text = fs.readFileSync(AI_CONFIG_FILE, 'utf8');
+  if (!/^server:\s*$/m.test(text)) {
+    return { ok: false, msg: '配置文件里没有 server 段，无法自动改端口' };
+  }
+  // 只改 server: 段内的键，避免误伤 LLM/TTS 等同名配置
+  const lines = text.split(/\r?\n/);
+  let inServer = false;
+  let seenPort = false, seenHttp = false, seenWs = false;
+  const out = lines.map((line) => {
+    if (/^\S/.test(line)) inServer = /^server:\s*$/.test(line);
+    if (!inServer) return line;
+    const ind = (line.match(/^\s*/) || [''])[0];
+    if (/^\s*port:\s*/.test(line)) { seenPort = true; return ind + 'port: ' + wsPort; }
+    if (/^\s*http_port:\s*/.test(line)) { seenHttp = true; return ind + 'http_port: ' + otaPort; }
+    if (/^\s*websocket:\s*/.test(line)) {
+      seenWs = true;
+      return ind + 'websocket: ws://' + lanIpV + ':' + wsPort + '/xiaozhi/v1/';
+    }
+    return line;
+  });
+  if (!seenPort) return { ok: false, msg: 'server 段缺少 port，请手动补上' };
+  if (!seenHttp) return { ok: false, msg: 'server 段缺少 http_port，请手动补上' };
+  try {
+    fs.writeFileSync(AI_CONFIG_FILE, out.join('\n'), 'utf8');
+  } catch (e) {
+    return { ok: false, msg: '写入配置失败：' + ((e && e.message) || e) };
+  }
+  return { ok: true, msg: seenWs ? '' : '配置里没有 websocket 项，OTA 下发的地址可能仍是旧端口' };
+}
+
+// 定位 LLM 段里的 api_key 行：优先 DeepSeekLLM 块，其次 LLM 段内第一个
+function findApiKeyLine(lines) {
+  let inLlm = false;
+  let inProvider = false;
+  let fallback = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\S/.test(line)) {
+      inLlm = /^LLM:\s*$/.test(line);
+      inProvider = false;
+      continue;
+    }
+    if (!inLlm) continue;
+    if (/^\s{2}\S+:\s*$/.test(line)) inProvider = /^\s{2}DeepSeekLLM:\s*$/.test(line);
+    if (/^\s*api_key:\s*/.test(line)) {
+      if (inProvider) return i;
+      if (fallback < 0) fallback = i;
+    }
+  }
+  return fallback;
+}
+
+function readAiKey() {
+  if (!AI_CONFIG_FILE || !fs.existsSync(AI_CONFIG_FILE)) return '';
+  try {
+    const lines = fs.readFileSync(AI_CONFIG_FILE, 'utf8').split(/\r?\n/);
+    const i = findApiKeyLine(lines);
+    if (i < 0) return '';
+    return String(lines[i].replace(/^\s*api_key:\s*/, '').replace(/^["']|["']$/g, '')).trim();
+  } catch (_) { return ''; }
+}
+
+function maskApiKey(k) {
+  if (!k) return '';
+  if (k.length <= 12) return k.replace(/.(?=.{4})/g, '*');
+  return k.slice(0, 5) + '****' + k.slice(-4);
+}
+
+function patchAiKey(key) {
+  if (!AI_CONFIG_FILE || !fs.existsSync(AI_CONFIG_FILE)) {
+    return { ok: false, msg: '找不到服务端配置文件：' + (AI_CONFIG_FILE || '（未找到服务端目录）') };
+  }
+  let lines = fs.readFileSync(AI_CONFIG_FILE, 'utf8').split(/\r?\n/);
+  const i = findApiKeyLine(lines);
+  if (i < 0) return { ok: false, msg: '配置里没有找到 LLM 的 api_key 行' };
+  const ind = (lines[i].match(/^\s*/) || [''])[0];
+  lines[i] = ind + 'api_key: ' + key;
+  try {
+    fs.writeFileSync(AI_CONFIG_FILE, lines.join('\n'), 'utf8');
+  } catch (e) {
+    return { ok: false, msg: '写入 API Key 失败：' + ((e && e.message) || e) };
+  }
+  return { ok: true, msg: '' };
 }
 function lanIp() {
   const ifaces = os.networkInterfaces();
@@ -277,9 +385,9 @@ function stopAi(cb) {
     killTree(pid, () => { aiChild = null; aiStartedAt = 0; cb && cb(); });
     return;
   }
-  findPortPid(AI_WS_PORT, (pid) => {
+  findPortPid(aiWsPort, (pid) => {
     if (!pid) { cb && cb(); return; }
-    pushLog('[panel] AI 端口 ' + AI_WS_PORT + ' 被 PID ' + pid + ' 占用，强制结束');
+    pushLog('[panel] AI 端口 ' + aiWsPort + ' 被 PID ' + pid + ' 占用，强制结束');
     killTree(pid, () => cb && cb());
   });
 }
@@ -362,6 +470,11 @@ const PAGE = `<!doctype html>
   #epInput{width:100%;margin-top:12px;min-height:76px;resize:vertical;font-family:Consolas,monospace;
            font-size:12px;line-height:1.5;padding:10px 12px;border:2px solid var(--line);
            border-radius:10px;background:#fff;color:var(--ink)}
+  .lbl{font-size:13px;color:var(--muted)}
+  .num{width:92px;font:inherit;font-size:13px;padding:7px 10px;border:2px solid var(--line);
+       border-radius:10px;background:#fff;color:var(--ink)}
+  #aiKeyInput{font:inherit;font-size:13px;padding:7px 12px;border:2px solid var(--line);
+              border-radius:10px;background:#fff;color:var(--ink)}
   .hint{color:var(--muted);font-size:12px;margin-top:8px}
   .foot{text-align:center;color:var(--muted);font-size:12px;margin-top:22px}
 </style></head>
@@ -418,8 +531,20 @@ const PAGE = `<!doctype html>
       <div class="k">Python</div><div class="v" id="aiPy">--</div>
       <div class="k">设备 WebSocket</div><div class="v" id="aiWs">--</div>
       <div class="k">设备 OTA</div><div class="v" id="aiOta">--</div>
+      <div class="k">当前 Key</div><div class="v" id="aiKeyNow">--</div>
       <div class="k">说明</div><div class="v">首次启动要加载语音识别模型，<b>约需 1 分钟</b>；目录可用环境变量 <code>XIAOZHI_SERVER_DIR</code> 指定</div>
     </div>
+    <div class="row" style="margin-top:14px">
+      <span class="lbl">WebSocket 端口</span>
+      <input class="num" id="aiWsPort" type="number" min="1" max="65535">
+      <span class="lbl">OTA 端口</span>
+      <input class="num" id="aiOtaPort" type="number" min="1" max="65535">
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="aiKeyInput" placeholder="新的 DeepSeek API Key（sk-...），留空则不改" spellcheck="false" style="flex:1">
+      <button class="g" id="btnAiSave">保存并重启</button>
+    </div>
+    <div class="hint">保存会把端口和 Key 直接写进小智服务端的 <code>data/.config.yaml</code>；AI 在运行时自动重启。</div>
   </div>
 
   <div class="card">
@@ -460,8 +585,13 @@ const PAGE = `<!doctype html>
 const $ = (id) => document.getElementById(id);
 let upTimer = null;
 
-function api(path, method) {
-  return fetch(path, { method: method || 'GET' }).then(r => r.json()).catch(() => ({}));
+function api(path, method, body) {
+  const opt = { method: method || 'GET' };
+  if (body !== undefined) {
+    opt.headers = { 'Content-Type': 'application/json' };
+    opt.body = JSON.stringify(body);
+  }
+  return fetch(path, opt).then(r => r.json()).catch(() => ({}));
 }
 
 function fmtUptime(sec) {
@@ -514,6 +644,9 @@ async function refresh() {
   $('aiOta').innerHTML = ai.dir ? 'http://' + ai.lanIp + ':' + ai.otaPort + ' <code>/xiaozhi/ota/</code>' : '--';
   $('btnAiStart').disabled = aiOn || !ai.appExists;
   $('btnAiStop').disabled = !aiOn;
+  if (document.activeElement !== $('aiWsPort')) $('aiWsPort').value = ai.wsPort || '';
+  if (document.activeElement !== $('aiOtaPort')) $('aiOtaPort').value = ai.otaPort || '';
+  $('aiKeyNow').textContent = ai.apiKey || (ai.dir ? '未读取到' : '--');
 }
 
 document.querySelectorAll('button').forEach(btn => {
@@ -526,6 +659,19 @@ document.querySelectorAll('button').forEach(btn => {
     if (id === 'btnMStop') { btn.textContent = '停止中…'; await api('/api/meting/stop','POST'); btn.textContent = '停止'; }
     if (id === 'btnAiStart') { btn.textContent = '启动中…'; const r = await api('/api/ai/start','POST'); btn.textContent = '启动'; if (r && r.ok === false) alert('启动失败：' + r.msg); }
     if (id === 'btnAiStop') { btn.textContent = '停止中…'; await api('/api/ai/stop','POST'); btn.textContent = '停止'; }
+    if (id === 'btnAiSave') {
+      const wsPort = Number($('aiWsPort').value);
+      const otaPort = Number($('aiOtaPort').value);
+      const apiKey = $('aiKeyInput').value.trim();
+      if (!wsPort || !otaPort) { alert('端口不能为空'); return; }
+      if (apiKey && !/^sk-[A-Za-z0-9_-]{8,}$/.test(apiKey)) { alert('API Key 应以 sk- 开头且只含英文数字，注意不要带空格'); return; }
+      btn.textContent = '保存中…';
+      const r = await api('/api/ai/config', 'POST', { wsPort, otaPort, apiKey });
+      btn.textContent = '保存并重启';
+      if (r && r.ok === false) { alert('保存失败：' + r.msg); return; }
+      $('aiKeyInput').value = '';
+      setTimeout(refresh, 800);
+    }
     if (id === 'btnClear') { rawAll = []; await api('/api/logs/clear','POST'); scheduleRender(); }
     if (id === 'btnFolder') { await api('/api/open-folder','POST'); return; }
     if (id === 'btnEpSave') {
@@ -779,7 +925,7 @@ const panel = http.createServer(async (req, res) => {
     return;
   }
   if (p === '/api/ai/status') {
-    probePort(AI_WS_PORT, (busy) => {
+    probePort(aiWsPort, (busy) => {
       json(res, {
         dir: AI_DIR,
         appExists: !!AI_APP && fs.existsSync(AI_APP),
@@ -789,10 +935,41 @@ const panel = http.createServer(async (req, res) => {
         external: !aiChild && busy,
         listening: !!aiChild || busy,
         uptime: aiChild && aiStartedAt ? Math.floor((Date.now() - aiStartedAt) / 1000) : 0,
-        wsPort: AI_WS_PORT,
-        otaPort: AI_OTA_PORT,
+        wsPort: aiWsPort,
+        otaPort: aiOtaPort,
         lanIp: lanIp(),
+        apiKey: maskApiKey(readAiKey()),
       });
+    });
+    return;
+  }
+  if (p === '/api/ai/config' && req.method === 'POST') {
+    readBody(req, (body) => {
+      const wsPort = Number(body.wsPort);
+      const otaPort = Number(body.otaPort);
+      const apiKey = String(body.apiKey || '').trim();
+      const badPort = (n) => !Number.isInteger(n) || n < 1 || n > 65535;
+      if (badPort(wsPort) || badPort(otaPort)) { json(res, { ok: false, msg: '端口必须是 1-65535 的整数' }); return; }
+      if (wsPort === otaPort) { json(res, { ok: false, msg: '两个端口不能相同' }); return; }
+      if (apiKey && !/^sk-[A-Za-z0-9_-]{8,}$/.test(apiKey)) {
+        json(res, { ok: false, msg: 'API Key 格式不对，应以 sk- 开头且只含英文数字' });
+        return;
+      }
+      const pr = patchAiConfig(wsPort, otaPort, lanIp());
+      if (!pr.ok) { json(res, pr); return; }
+      if (apiKey) {
+        const kr = patchAiKey(apiKey);
+        if (!kr.ok) { json(res, kr); return; }
+      }
+      aiWsPort = wsPort;
+      aiOtaPort = otaPort;
+      try { fs.writeFileSync(AI_PORTS_FILE, JSON.stringify({ wsPort, otaPort }, null, 2), 'utf8'); } catch (_) {}
+      pushLog('[panel] AI 配置已更新：端口 ' + wsPort + '/' + otaPort + (apiKey ? '，API Key 已替换' : ''));
+      if (aiChild) {
+        stopAi(() => setTimeout(() => json(res, Object.assign({ restarted: true }, startAi())), 800));
+      } else {
+        json(res, { ok: true, msg: '已保存' + (pr.msg ? '（' + pr.msg + '）' : '') });
+      }
     });
     return;
   }
